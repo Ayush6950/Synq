@@ -17,44 +17,6 @@ Teams create Workspaces → Projects → Boards → Tasks, and see changes from 
 | Realtime transport | Socket.io | Live board updates pushed to connected clients |
 | Infra | Docker Compose | One-command local environment |
 
-## Architecture
-
-```
-apps/
-  web/      -> Next.js frontend
-  api/      -> Express API (talks to Postgres via Prisma, Redis for cache/pubsub/rate-limit)
-  worker/   -> BullMQ worker (background jobs, consumes Redis queue)
-packages/
-  db/       -> Shared Prisma schema + client used by api & worker
-```
-
-### Request flow example: moving a task
-
-1. User drags a task -> optimistic UI update in Next.js
-2. `PATCH /api/tasks/:id/move` hits Express
-3. Express updates Postgres via Prisma, invalidates Redis cache
-4. Express publishes an event to Redis (`board:<id>` channel)
-5. Socket.io (subscribed to that channel) pushes the update to every other connected client on that board
-6. Everyone's UI updates live, no refresh
-
-## Getting Started
-
-```bash
-git clone <your-repo-url>
-cd synq
-cp .env.example .env
-docker-compose up --build
-```
-
-- Web: http://localhost:3000
-- API: http://localhost:4000
-- Postgres: localhost:5432
-- Redis: localhost:6379
-
-Run Prisma migrations (first time):
-```bash
-docker-compose exec api npx prisma migrate dev
-```
 
 ## Features
 
@@ -66,6 +28,3 @@ docker-compose exec api npx prisma migrate dev
 - Full-text task search (Postgres `tsvector`)
 - Fully Dockerized (Postgres, Redis, API, worker, web)
 
-## Why this project
-
-Built to demonstrate distributed-systems fundamentals beyond basic CRUD: caching strategy, pub/sub fan-out across server instances, decoupled background processing, and containerized multi-service orchestration.
