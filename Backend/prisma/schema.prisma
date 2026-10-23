@@ -1,3 +1,18 @@
+// =============================================================================
+// Synq — real-time collaborative project management (Trello / Linear style)
+// Workspaces → Projects → Boards → Columns → Tasks
+// Live updates via WebSockets + Redis pub/sub.
+//
+// Scalability principles used in this schema
+//  1. Fractional-index string positions   → moving a card = 1 row update (no shifting)
+//  2. workspaceId denormalised on hot tables → cheap authz + future sharding key
+//  3. Optimistic concurrency (Task.version)  → safe concurrent edits
+//  4. Monotonic BigInt event log (Activity)  → clients resync after reconnect
+//  5. Transactional outbox                   → reliable DB → Redis publishing
+//  6. Soft delete / archive                  → Trello-style archive, undo, audit
+//  7. Composite indexes matching real queries (no redundant ones)
+//  8. Ephemeral data (presence, cursors, typing) lives in Redis, NOT here
+// =============================================================================
 
 generator client {
   provider = "prisma-client"
@@ -19,33 +34,110 @@ enum WorkspaceRole {
   GUEST
 }
 
+enum BoardRole {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum BoardVisibility {
+  PRIVATE // only BoardMembers
+  WORKSPACE // every workspace member (except guests unless added)
+}
+
 enum TaskPriority {
+  NONE
   LOW
   MEDIUM
   HIGH
   URGENT
 }
 
+enum ActivityType {
+  WORKSPACE_UPDATED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  PROJECT_ARCHIVED
+  BOARD_CREATED
+  BOARD_UPDATED
+  BOARD_ARCHIVED
+  COLUMN_CREATED
+  COLUMN_UPDATED
+  COLUMN_MOVED
+  COLUMN_ARCHIVED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_MOVED
+  TASK_ARCHIVED
+  TASK_RESTORED
+  TASK_ASSIGNED
+  TASK_UNASSIGNED
+  TASK_LABELED
+  TASK_UNLABELED
+  COMMENT_ADDED
+  COMMENT_EDITED
+  COMMENT_DELETED
+  ATTACHMENT_ADDED
+  ATTACHMENT_REMOVED
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_MENTIONED
+  COMMENT_ADDED
+  DUE_SOON
+  INVITED_TO_WORKSPACE
+  INVITED_TO_BOARD
+}
+
 // --------------------
-// USER
+// USER & AUTH
 // --------------------
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String
-  avatarUrl String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id              String    @id @default(cuid())
+  email           String    @unique
+  name            String
+  avatarUrl       String?
+  passwordHash    String? // null for OAuth-only users
+  emailVerifiedAt DateTime?
+  deletedAt       DateTime? // soft delete (GDPR: anonymise, keep FK integrity)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  memberships    WorkspaceMember[]
-  createdSpaces  Workspace[] @relation("WorkspaceCreator")
-  createdProjects Project[]  @relation("ProjectCreator")
-  createdBoards   Board[]    @relation("BoardCreator")
-  createdTasks    Task[]     @relation("TaskCreator")
-  assignments     TaskAssignee[]
-  comments        Comment[]
-  activities      Activity[] @relation("ActivityActor")
+  sessions          Session[]
+  memberships       WorkspaceMember[]
+  boardMemberships  BoardMember[]
+  createdWorkspaces Workspace[]       @relation("WorkspaceCreator")
+  createdProjects   Project[]         @relation("ProjectCreator")
+  createdBoards     Board[]           @relation("BoardCreator")
+  createdTasks      Task[]            @relation("TaskCreator")
+  assignments       TaskAssignee[]
+  comments          Comment[]
+  attachments       Attachment[]
+  activities        Activity[]        @relation("ActivityActor")
+  notifications     Notification[]    @relation("NotificationRecipient")
+  sentInvites       WorkspaceInvite[] @relation("InviteSender")
+}
+
+// Refresh-token sessions (JWT access tokens stay stateless).
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  tokenHash  String    @unique // store a hash, never the raw refresh token
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt]) // for periodic cleanup job
 }
 
 // --------------------
@@ -53,25 +145,27 @@ model User {
 // --------------------
 
 model Workspace {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   name        String
-  slug        String   @unique
-  createdById String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  slug        String    @unique
+  createdById String?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
-  createdBy  User              @relation("WorkspaceCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  members    WorkspaceMember[]
-  projects   Project[]
-  labels     Label[]
-  activities Activity[]
+  createdBy     User?             @relation("WorkspaceCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  members       WorkspaceMember[]
+  invites       WorkspaceInvite[]
+  projects      Project[]
+  boards        Board[]
+  tasks         Task[]
+  labels        Label[]
+  activities    Activity[]
+  notifications Notification[]
+  outbox        OutboxEvent[]
 
   @@index([createdById])
 }
-
-// --------------------
-// WORKSPACE MEMBERSHIP
-// --------------------
 
 model WorkspaceMember {
   id          String        @id @default(cuid())
@@ -83,8 +177,26 @@ model WorkspaceMember {
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@unique([workspaceId, userId])
-  @@index([userId, workspaceId])
+  @@unique([workspaceId, userId]) // also serves "members of workspace" lookups
+  @@index([userId]) // "workspaces for user" lookups
+}
+
+model WorkspaceInvite {
+  id          String        @id @default(cuid())
+  workspaceId String
+  email       String
+  role        WorkspaceRole @default(MEMBER)
+  tokenHash   String        @unique
+  invitedById String?
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User?     @relation("InviteSender", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@unique([workspaceId, email])
+  @@index([email])
 }
 
 // --------------------
@@ -92,19 +204,24 @@ model WorkspaceMember {
 // --------------------
 
 model Project {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   workspaceId String
+  key         String // short prefix for task ids, e.g. "SYN" → SYN-42
   name        String
   description String?
-  createdById String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  taskSeq     Int       @default(0) // atomic counter for Task.number
+  createdById String?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  createdBy User      @relation("ProjectCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdBy User?     @relation("ProjectCreator", fields: [createdById], references: [id], onDelete: SetNull)
   boards    Board[]
+  tasks     Task[]
 
-  @@index([workspaceId, createdAt])
+  @@unique([workspaceId, key])
+  @@index([workspaceId, archivedAt, createdAt])
 }
 
 // --------------------
@@ -112,72 +229,119 @@ model Project {
 // --------------------
 
 model Board {
-  id          String   @id @default(cuid())
+  id          String          @id @default(cuid())
+  workspaceId String // denormalised for authz / sharding
   projectId   String
   name        String
-  createdById String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  visibility  BoardVisibility @default(WORKSPACE)
+  position    String          @db.VarChar(64) // fractional index among project boards
+  createdById String?
+  archivedAt  DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
 
-  project   Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  createdBy User         @relation("BoardCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  columns   BoardColumn[]
+  workspace  Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project    Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy  User?         @relation("BoardCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  columns    BoardColumn[]
+  tasks      Task[]
+  members    BoardMember[]
+  activities Activity[]
 
-  @@index([projectId, createdAt])
+  @@index([projectId, archivedAt, position])
+  @@index([workspaceId])
+}
+
+model BoardMember {
+  boardId  String
+  userId   String
+  role     BoardRole @default(EDITOR)
+  joinedAt DateTime  @default(now())
+
+  board Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([boardId, userId])
+  @@index([userId])
 }
 
 // --------------------
-// BOARD COLUMN
+// BOARD COLUMN (list)
 // --------------------
 
 model BoardColumn {
-  id        String   @id @default(cuid())
-  boardId   String
-  name      String
-  position  Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String    @id @default(cuid())
+  boardId    String
+  name       String
+  position   String    @db.VarChar(64) // fractional index (see note below)
+  wipLimit   Int? // optional Kanban work-in-progress limit
+  isDone     Boolean   @default(false) // moving a task here sets Task.completedAt
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 
-  board Board   @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
   tasks Task[]
 
-  @@unique([boardId, position])
-  @@index([boardId])
+  // NOT unique on purpose: two clients can briefly generate the same key;
+  // resolve with a tie-break on id and a background rebalance.
+  @@index([boardId, archivedAt, position])
 }
 
 // --------------------
-// TASK
+// TASK (card)
 // --------------------
+// POSITION NOTE: use fractional indexing (e.g. the `fractional-indexing` npm
+// package). Insert between "a0" and "a1" → "a0V". Only the moved row is
+// written. IMPORTANT: add `COLLATE "C"` to position columns in a raw SQL
+// migration so ordering is byte-wise and matches the JS library:
+//   ALTER TABLE "Task"        ALTER COLUMN "position" TYPE varchar(64) COLLATE "C";
+//   ALTER TABLE "BoardColumn" ALTER COLUMN "position" TYPE varchar(64) COLLATE "C";
+//   ALTER TABLE "Board"       ALTER COLUMN "position" TYPE varchar(64) COLLATE "C";
 
 model Task {
-  id          String       @id @default(cuid())
-  columnId    String
-  title       String
-  description String?
-  priority    TaskPriority @default(MEDIUM)
-  position    Int
-  dueDate     DateTime?
-  version     Int          @default(1)
-  createdById String
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  id           String       @id @default(cuid())
+  workspaceId  String // denormalised
+  projectId    String // denormalised
+  boardId      String // denormalised → cross-column queries without joins
+  columnId     String
+  parentId     String? // sub-tasks
+  number       Int // per-project sequence → "SYN-42"
+  title        String
+  description  String?
+  priority     TaskPriority @default(NONE)
+  position     String       @db.VarChar(64)
+  startDate    DateTime?
+  dueDate      DateTime?
+  completedAt  DateTime?
+  archivedAt   DateTime?
+  version      Int          @default(1) // optimistic concurrency: UPDATE ... WHERE version = ?
+  commentCount Int          @default(0) // denormalised counters for card badges
+  attachCount  Int          @default(0)
+  createdById  String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 
-  column     BoardColumn   @relation(fields: [columnId], references: [id], onDelete: Cascade)
-  createdBy  User          @relation("TaskCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  assignees  TaskAssignee[]
-  comments   Comment[]
-  labels     TaskLabel[]
-  activities Activity[]
+  workspace   Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project     Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  board       Board          @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  column      BoardColumn    @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  parent      Task?          @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
+  subTasks    Task[]         @relation("SubTasks")
+  createdBy   User?          @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  assignees   TaskAssignee[]
+  comments    Comment[]
+  attachments Attachment[]
+  labels      TaskLabel[]
+  activities  Activity[]
 
-  @@unique([columnId, position])
-  @@index([columnId, createdAt])
+  @@unique([projectId, number])
+  @@index([columnId, archivedAt, position]) // render a column in order
+  @@index([boardId, archivedAt]) // board-wide queries / filters
+  @@index([parentId])
+  @@index([workspaceId, dueDate]) // "due soon" across workspace
   @@index([createdById, createdAt])
-  @@index([dueDate])
 }
-
-// --------------------
-// TASK ASSIGNEES
-// --------------------
 
 model TaskAssignee {
   taskId     String
@@ -188,7 +352,7 @@ model TaskAssignee {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([taskId, userId])
-  @@index([userId, taskId])
+  @@index([userId, taskId]) // "my tasks"
 }
 
 // --------------------
@@ -196,15 +360,37 @@ model TaskAssignee {
 // --------------------
 
 model Comment {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   taskId    String
-  authorId  String
+  authorId  String?
   content   String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  editedAt  DateTime?
+  deletedAt DateTime? // soft delete keeps thread context
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 
-  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  author User @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  task   Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User? @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, createdAt])
+}
+
+// --------------------
+// ATTACHMENTS (files live in S3/R2; DB stores metadata only)
+// --------------------
+
+model Attachment {
+  id          String   @id @default(cuid())
+  taskId      String
+  uploaderId  String?
+  fileName    String
+  mimeType    String
+  sizeBytes   Int
+  storageKey  String   @unique
+  createdAt   DateTime @default(now())
+
+  task     Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploader User? @relation(fields: [uploaderId], references: [id], onDelete: SetNull)
 
   @@index([taskId, createdAt])
 }
@@ -226,10 +412,6 @@ model Label {
   @@unique([workspaceId, name])
 }
 
-// --------------------
-// TASK LABELS
-// --------------------
-
 model TaskLabel {
   taskId  String
   labelId String
@@ -238,26 +420,74 @@ model TaskLabel {
   label Label @relation(fields: [labelId], references: [id], onDelete: Cascade)
 
   @@id([taskId, labelId])
-  @@index([labelId, taskId])
+  @@index([labelId, taskId]) // "all tasks with label"
 }
 
 // --------------------
-// ACTIVITY HISTORY
+// ACTIVITY LOG  (audit trail + realtime replay cursor)
 // --------------------
+// BigInt autoincrement id = monotonic cursor. A client that reconnects sends
+// `lastEventId`; the server replays `WHERE boardId = ? AND id > ? ORDER BY id`.
+// For very large installs, partition by createdAt (monthly) and archive old rows.
 
 model Activity {
-  id          String   @id @default(cuid())
+  id          BigInt       @id @default(autoincrement())
   workspaceId String
-  actorId     String
+  boardId     String?
   taskId      String?
-  type        String
-  metadata    Json?
-  createdAt   DateTime @default(now())
+  actorId     String?
+  type        ActivityType
+  metadata    Json? // e.g. { from: colId, to: colId, field: "title", old, new }
+  createdAt   DateTime     @default(now())
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  board         Board?         @relation(fields: [boardId], references: [id], onDelete: SetNull)
+  task          Task?          @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  actor         User?          @relation("ActivityActor", fields: [actorId], references: [id], onDelete: SetNull)
+  notifications Notification[]
+
+  @@index([boardId, id]) // realtime catch-up + board activity feed
+  @@index([taskId, id]) // task history
+  @@index([workspaceId, createdAt])
+}
+
+// --------------------
+// TRANSACTIONAL OUTBOX  (DB write + Redis publish without dual-write bugs)
+// --------------------
+// 1. In the SAME transaction as the mutation, insert an OutboxEvent.
+// 2. A relay worker polls (SELECT ... WHERE publishedAt IS NULL ORDER BY id
+//    FOR UPDATE SKIP LOCKED), PUBLISHes to Redis channel `board:{boardId}`,
+//    then sets publishedAt. Purge published rows after N days.
+
+model OutboxEvent {
+  id          BigInt    @id @default(autoincrement())
+  workspaceId String
+  channel     String // e.g. "board:clx123"
+  payload     Json
+  createdAt   DateTime  @default(now())
+  publishedAt DateTime?
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  actor     User      @relation("ActivityActor", fields: [actorId], references: [id], onDelete: Restrict)
-  task      Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
 
-  @@index([workspaceId, createdAt])
-  @@index([taskId, createdAt])
+  @@index([publishedAt, id])
+}
+
+// --------------------
+// NOTIFICATIONS (in-app inbox; pushed live over the user's socket)
+// --------------------
+
+model Notification {
+  id          String           @id @default(cuid())
+  workspaceId String
+  userId      String
+  type        NotificationType
+  activityId  BigInt?
+  readAt      DateTime?
+  createdAt   DateTime         @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  activity  Activity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt, createdAt]) // unread inbox, newest first
 }
