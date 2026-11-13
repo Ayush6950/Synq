@@ -57,6 +57,7 @@ enum ActivityType {
   WORKSPACE_UPDATED
   MEMBER_ADDED
   MEMBER_REMOVED
+  MEMBER_ROLE_UPDATED
   PROJECT_CREATED
   PROJECT_UPDATED
   PROJECT_ARCHIVED
@@ -107,19 +108,20 @@ model User {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  sessions          Session[]
-  memberships       WorkspaceMember[]
-  boardMemberships  BoardMember[]
-  createdWorkspaces Workspace[]       @relation("WorkspaceCreator")
-  createdProjects   Project[]         @relation("ProjectCreator")
-  createdBoards     Board[]           @relation("BoardCreator")
-  createdTasks      Task[]            @relation("TaskCreator")
-  assignments       TaskAssignee[]
-  comments          Comment[]
-  attachments       Attachment[]
-  activities        Activity[]        @relation("ActivityActor")
-  notifications     Notification[]    @relation("NotificationRecipient")
-  sentInvites       WorkspaceInvite[] @relation("InviteSender")
+  sessions             Session[]
+  passwordResetTokens  PasswordResetToken[]
+  memberships          WorkspaceMember[]
+  boardMemberships     BoardMember[]
+  createdWorkspaces    Workspace[]          @relation("WorkspaceCreator")
+  createdProjects      Project[]            @relation("ProjectCreator")
+  createdBoards        Board[]              @relation("BoardCreator")
+  createdTasks         Task[]               @relation("TaskCreator")
+  assignments          TaskAssignee[]
+  comments             Comment[]
+  attachments          Attachment[]
+  activities           Activity[]           @relation("ActivityActor")
+  notifications        Notification[]       @relation("NotificationRecipient")
+  sentInvites          WorkspaceInvite[]    @relation("InviteSender")
 }
 
 // Refresh-token sessions (JWT access tokens stay stateless).
@@ -138,6 +140,33 @@ model Session {
 
   @@index([userId])
   @@index([expiresAt]) // for periodic cleanup job
+}
+
+// Password reset tokens for forgot/reset password flow.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // SHA-256 hash of plaintext token
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Verification tokens for email confirmation.
+model VerificationToken {
+  id         String   @id @default(cuid())
+  identifier String // e.g. email
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  @@unique([identifier, tokenHash])
+  @@index([expiresAt])
 }
 
 // --------------------
@@ -338,6 +367,7 @@ model Task {
   @@unique([projectId, number])
   @@index([columnId, archivedAt, position]) // render a column in order
   @@index([boardId, archivedAt]) // board-wide queries / filters
+  @@index([boardId, completedAt]) // query completed tasks efficiently
   @@index([parentId])
   @@index([workspaceId, dueDate]) // "due soon" across workspace
   @@index([createdById, createdAt])
