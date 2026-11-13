@@ -2,6 +2,8 @@ import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import authRoutes from './modules/auth/auth.routes.js';
+import workspaceRoutes from './modules/workspaces/workspace.routes.js';
+import inviteRoutes from './modules/invites/invite.routes.js';
 
 const app: Express = express();
 
@@ -21,6 +23,8 @@ app.get('/health', (req: Request, res: Response) => {
 
 // App Routes
 app.use('/auth', authRoutes);
+app.use('/workspaces', workspaceRoutes);
+app.use('/invites', inviteRoutes);
 
 app.get('/', (req: Request, res: Response) => {
   res.send('Synq API is running');
