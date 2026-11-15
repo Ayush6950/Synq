@@ -1,10 +1,23 @@
-import dotenv from 'dotenv';
+import dotenv from "dotenv";
 dotenv.config();
 
-import app from './app.js';
+import app from "./app.js";
+import prisma from "./lib/prisma.js"; // <-- Point to src/lib/prisma.js
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`🚀 Synq Server running on http://localhost:${PORT}`);
-});
+async function startServer() {
+  try {
+    await prisma.$connect();
+    console.log("✅ Database connected successfully");
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Synq Server running on http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error("❌ Database connection failed:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
